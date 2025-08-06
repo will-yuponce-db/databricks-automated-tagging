@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "databricks_automated_tagger"
+version = "0.0.1"
+authors = [{ name = "Will Yuponce", email = "will.yuponce@databricks.com" }]
+description = "A small example package"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pyspark", "spacy", "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+[project.urls]
+Homepage = "https://github.com/pypa/sampleproject"
+Issues = "https://github.com/pypa/sampleproject/issues"
+[tool.hatch.metadata]
+allow-direct-references = true
