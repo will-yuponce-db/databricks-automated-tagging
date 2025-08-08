@@ -111,7 +111,7 @@ autotagger.join_and_write_with_metadata(
 - **Column Tagging 🧩:** Samples data per column, detects entities with spaCy, and tags columns if an entity is found.
 - **Table Tagging 🚩:** Applies rules using detected column tags (supports AND/OR logic).
 - **Join & Propagate ⬆️:** Inherits and merges tags on joined tables/columns.
-- **Bulk Tagging 🎛️:** Walks all tables in a catalog and applies tagging automatically.
+- **Bulk Tagging 🎛️:** Discovers all tables in a catalog and applies tagging automatically.
 
 ---
 
