@@ -1,116 +1,172 @@
-# Function to join two tables, write the result, and propagate metadata tags
-def join_and_write_with_metadata(table_name1, table_name2, tag_rules, on, how, save_as):
-    # Read both tables as DataFrames
-    df1 = spark.sql(f"SELECT * FROM {table_name1}")
-    df2 = spark.sql(f"SELECT * FROM {table_name2}")
-    # Get table tags for both tables from information_schema
-    table_tag_df = spark.sql(
-        f"SELECT * FROM {save_as.split('.')[0]}.information_schema.table_tags "
-        f"WHERE table_name = '{table_name1.split('.')[-1]}' OR table_name = '{table_name2.split('.')[-1]}'"
-    ).collect()
-    # Determine which DataFrame has more columns
-    biggest_df, smallest_df = (
-        (df1, df2) if len(df1.columns) > len(df2.columns) else (df2, df1)
-    )
-    # Find columns in the smaller DataFrame that are not in the bigger one
-    col_dif = [col for col in smallest_df.columns if col not in biggest_df.columns]
-    # Join the DataFrames on the specified column
-    joined_df = biggest_df.join(smallest_df.select(col_dif + [on]), on=on, how=how)
-    # Write the joined DataFrame as a table
-    joined_df.write.mode("overwrite").option("overWriteSchema", "true").saveAsTable(
-        save_as
-    )
-    # Apply table-level tags based on tag_rules and existing tags
-    for tag_rule in tag_rules:
-        key = list(tag_rule.keys())[0]
-        tag_dict = tag_rule[key]
-        highest_priority_tag = list(tag_dict.keys())[0]
-        for row in table_tag_df:
-            if row["tag_name"] == key:
-                highest_priority_tag = (
-                    row["tag_value"]
-                    if tag_dict[row["tag_value"]] > tag_dict[highest_priority_tag]
-                    else highest_priority_tag
-                )
-        if highest_priority_tag != "":
-            spark.sql(f"SET TAG ON TABLE {save_as} {key} = {highest_priority_tag}")
-    # Get column tags for both tables from information_schema
-    column_tag_df = spark.sql(
-        f"SELECT * FROM {table_name1.split('.')[0]}.information_schema.column_tags WHERE table_name = '{table_name1.split('.')[-1]}' OR table_name = '{table_name2.split('.')[-1]}' AND tag_name = 'entity_type'"
-    ).collect()
-    column_tags = {}
-    # Organize column tags by column name
-    for row in column_tag_df:
-        if row.column_name not in column_tags:
-            column_tags[row.column_name] = {}
-            column_tags[row.column_name][row.tag_name] = row.tag_value
-    # Set column tags on the joined table
-    for column_name in column_tags:
-        for tag_name in column_tags[column_name]:
-            spark.sql(
-                f"SET TAG ON COLUMN {save_as + '.' + column_name} {tag_name} = {column_tags[column_name][tag_name]}"
-            )
+from pyspark.sql.functions import expr, col, udf 
+from pyspark.sql.functions import count, desc, first
+from functools import reduce
+from datetime import datetime
+from pyspark.sql.types import StringType
+from pyspark.sql import SparkSession
+import spacy
 
-# Function to apply entity type tags to columns of a table
-def apply_column_tags(table_name):
-    # Read a sample of the table
-    df = spark.sql(f"SELECT * FROM {table_name} LIMIT 10")
-    # For each column, create a new column with the detected entity label
-    for column in df.columns:
-        df = df.withColumn(f"{column}_entity_type", get_entity_label(df[column]))
-    entity_cols = [c for c in df.columns if c.endswith("_entity_type")]
+nlp = spacy.load("en_core_web_sm")
+spark = SparkSession.builder.getOrCreate()
 
-    # Aggregate to get the most frequent label for each column
-    result = []
-    for c in entity_cols:
-        mode_df = (
-            df.groupBy(c)
-            .agg(count("*").alias("cnt"))
-            .orderBy(desc("cnt"))
-            .select(first(c).alias(c))
-            .limit(1)
+class AutoTagger:
+    def __init__(self, config):
+        self.table_rules = config["table_rules"]
+        self.tag_hierarchy = config["tag_hierarchy"]
+
+    # UDF to use NER to identify entities
+    @udf(StringType())
+    @staticmethod
+    def get_entity_label(text):
+        import spacy
+        text = str(text)
+        if "@" in text:
+            return "EMAIL"
+        nlp = spacy.load('en_core_web_sm')
+        doc = nlp(text,  disable=["tok2vec", "tagger", "parser", "attribute_ruler", "lemmatizer"])
+        if doc.ents:
+            if(len(doc.ents) > 1):
+                return "GPE"
+            return doc.ents[0].label_ 
+        else:
+            return 'No entities found'
+
+    # Function to join two tables, write the result, and propagate metadata tags
+    def join_and_write_with_metadata(self, table_name1, table_name2, on, how, save_as):
+        # Read both tables as DataFrames
+        df1 = spark.sql(f"SELECT * FROM {table_name1}")
+        df2 = spark.sql(f"SELECT * FROM {table_name2}")
+        # Get table tags for both tables from information_schema
+        table_tag_df = spark.sql(
+            f"SELECT * FROM {save_as.split('.')[0]}.information_schema.table_tags "
+            f"WHERE table_name = '{table_name1.split('.')[-1]}' OR table_name = '{table_name2.split('.')[-1]}'"
+        ).collect()
+        # Determine which DataFrame has more columns
+        biggest_df, smallest_df = (
+            (df1, df2) if len(df1.columns) > len(df2.columns) else (df2, df1)
         )
-        result.append(mode_df)
+        # Find columns in the smaller DataFrame that are not in the bigger one
+        col_dif = [col for col in smallest_df.columns if col not in biggest_df.columns]
+        # Join the DataFrames on the specified column
+        joined_df = biggest_df.join(smallest_df.select(col_dif + [on]), on=on, how=how)
+        # Write the joined DataFrame as a table
+        joined_df.write.mode("overwrite").option("overWriteSchema", "true").saveAsTable(
+            save_as
+        )
+        # Apply table-level tags based on tag_rules and existing tags
+        for tag_rule in self.tag_hierarchy:
+            key = list(tag_rule.keys())[0]
+            tag_dict = tag_rule[key]
+            highest_priority_tag = list(tag_dict.keys())[0]
+            for row in table_tag_df:
+                if row["tag_name"] == key:
+                    highest_priority_tag = (
+                        row["tag_value"]
+                        if tag_dict[row["tag_value"]] > tag_dict[highest_priority_tag]
+                        else highest_priority_tag
+                    )
+            # Only set tag if it doesn't exist
+            existing_tag = spark.sql(
+                f"SELECT * FROM {save_as.split('.')[0]}.information_schema.table_tags "
+                f"WHERE table_name = '{save_as.split('.')[-1]}' AND tag_name = '{key}'"
+            ).collect()
+            if highest_priority_tag != "" and not existing_tag:
+                spark.sql(f"SET TAG ON TABLE {save_as} {key} = {highest_priority_tag}")
+        # Get column tags for both tables from information_schema
+        column_tag_df = spark.sql(
+            f"SELECT * FROM {table_name1.split('.')[0]}.information_schema.column_tags WHERE table_name = '{table_name1.split('.')[-1]}' OR table_name = '{table_name2.split('.')[-1]}' AND tag_name = 'entity_type'"
+        ).collect()
+        column_tags = {}
+        # Organize column tags by column name
+        for row in column_tag_df:
+            if row.column_name not in column_tags:
+                column_tags[row.column_name] = {}
+                column_tags[row.column_name][row.tag_name] = row.tag_value
+        # Set column tags on the joined table only if they don't exist
+        for column_name in column_tags:
+            for tag_name in column_tags[column_name]:
+                existing_col_tag = spark.sql(
+                    f"SELECT * FROM {save_as.split('.')[0]}.information_schema.column_tags "
+                    f"WHERE table_name = '{save_as.split('.')[-1]}' AND column_name = '{column_name}' AND tag_name = '{tag_name}'"
+                ).collect()
+                if not existing_col_tag:
+                    spark.sql(
+                        f"SET TAG ON COLUMN {save_as + '.' + column_name} {tag_name} = {column_tags[column_name][tag_name]}"
+                    )
 
-    # Combine the results for all columns
-    agg_df = reduce(lambda a, b: a.crossJoin(b), result)
-    agg_row = agg_df.collect()[0]
-    # Set the entity_type tag for each column if an entity is found
-    for item in agg_row.asDict().items():
-        if item[1] != "No entities found":
-            spark.sql(
-                f"SET TAG ON COLUMN {table_name + '.' + '_'.join(item[0].split('_')[0:-2])} entity_type = {item[1]}"
+    # Function to apply entity type tags to columns of a table
+    def apply_column_tags(self, table_name):
+        # Read a sample of the table
+        df = spark.sql(f"SELECT * FROM {table_name} LIMIT 10")
+        # For each column, create a new column with the detected entity label
+        for column in df.columns:
+            df = df.withColumn(f"{column}_entity_type", AutoTagger.get_entity_label(df[column]))
+        entity_cols = [c for c in df.columns if c.endswith("_entity_type")]
+
+        # Aggregate to get the most frequent label for each column
+        result = []
+        for c in entity_cols:
+            mode_df = (
+                df.groupBy(c)
+                .agg(count("*").alias("cnt"))
+                .orderBy(desc("cnt"))
+                .select(first(c).alias(c))
+                .limit(1)
             )
+            result.append(mode_df)
 
-# Function to apply table-level tags based on column entity tags and rules
-def apply_table_tags(table_name, table_rules):
-    # Get all entity_type tags for columns in the table
-    tag_df = spark.sql(
-        f"SELECT * FROM {table_name.split('.')[0]}.information_schema.column_tags"
-        f" WHERE table_name = '{table_name.split('.')[-1]}' AND tag_name = 'entity_type'"
-    ).collect()
-    entity_tags = [row.tag_value for row in tag_df]
-    # Apply each rule to determine if the table should be tagged
-    for rule in table_rules:
-        cond_arr = [entity in rule["key_words"] for entity in entity_tags]
-        if rule["operation"] == "or" and any(cond_arr):
-            spark.sql(f"SET TAG ON TABLE {table_name} {rule['tag_key']} = {rule['tag_value']}")
-        if rule["operation"] == "and" and all(cond_arr):
-            spark.sql(f"SET TAG ON TABLE {table_name} {rule['tag_key']} = {rule['tag_value']}")
+        # Combine the results for all columns
+        agg_df = reduce(lambda a, b: a.crossJoin(b), result)
+        agg_row = agg_df.collect()[0]
+        # Set the entity_type tag for each column if an entity is found and tag doesn't exist
+        for item in agg_row.asDict().items():
+            if item[1] != "No entities found":
+                col_name = '_'.join(item[0].split('_')[0:-2])
+                existing_col_tag = spark.sql(
+                    f"SELECT * FROM {table_name.split('.')[0]}.information_schema.column_tags "
+                    f"WHERE table_name = '{table_name.split('.')[-1]}' AND column_name = '{col_name}' AND tag_name = 'entity_type'"
+                ).collect()
+                if not existing_col_tag:
+                    spark.sql(
+                        f"SET TAG ON COLUMN {table_name + '.' + col_name} entity_type = {item[1]}"
+                    )
 
-# Function to apply column and table tags to all tables in a catalog
-def apply_tagging_to_catalog(catalog, table_rules):
-  # Get all schemas in the catalog
-  schema_df = spark.sql(f"SHOW SCHEMAS IN {catalog}")
-  for schema_row in schema_df.collect():
-    schema = schema_row["databaseName"]
-    if schema != "information_schema":
-      # Get all tables in the schema
-      table_df = spark.sql(f"SHOW TABLES IN {catalog}.{schema}")
-      for table_row in table_df.collect():
-        try:
-            # Apply column and table tags to each table
-            apply_column_tags(f"{catalog}.{schema}.{table_row['tableName']}")
-            apply_table_tags(f"{catalog}.{schema}.{table_row['tableName']}", table_rules)
-        except:
-            print(f"Could not apply tags to table {catalog}.{schema}.{table_row['tableName']}")
+    # Function to apply table-level tags based on column entity tags and rules
+    def apply_table_tags(self, table_name):
+        # Get all entity_type tags for columns in the table
+        tag_df = spark.sql(
+            f"SELECT * FROM {table_name.split('.')[0]}.information_schema.column_tags"
+            f" WHERE table_name = '{table_name.split('.')[-1]}' AND tag_name = 'entity_type'"
+        ).collect()
+        entity_tags = [row.tag_value for row in tag_df]
+        # Apply each rule to determine if the table should be tagged
+        for rule in self.table_rules:
+            cond_arr = [entity in entity_tags for entity in rule["key_words"]]
+            if rule["operation"] == "or" and any(cond_arr):
+                existing_tag = spark.sql(
+                    f"SELECT * FROM {table_name.split('.')[0]}.information_schema.table_tags "
+                    f"WHERE table_name = '{table_name.split('.')[-1]}' AND tag_name = '{rule['tag_key']}'"
+                ).collect()
+                if not existing_tag:
+                    spark.sql(f"SET TAG ON TABLE {table_name} {rule['tag_key']} = {rule['tag_value']}")
+            if rule["operation"] == "and" and all(cond_arr):
+                existing_tag = spark.sql(
+                    f"SELECT * FROM {table_name.split('.')[0]}.information_schema.table_tags "
+                    f"WHERE table_name = '{table_name.split('.')[-1]}' AND tag_name = '{rule['tag_key']}'"
+                ).collect()
+                if not existing_tag:
+                    spark.sql(f"SET TAG ON TABLE {table_name} {rule['tag_key']} = {rule['tag_value']}")
+
+    # Function to apply column and table tags to all tables in a catalog
+    def apply_tagging_to_catalog(self, catalog):
+        # Get all schemas in the catalog
+        schema_df = spark.sql(f"SHOW SCHEMAS IN {catalog}")
+        for schema_row in schema_df.collect():
+            schema = schema_row["databaseName"]
+            if schema != "information_schema":
+                # Get all tables in the schema
+                table_df = spark.sql(f"SHOW TABLES IN {catalog}.{schema}")
+                for table_row in table_df.collect():
+                    # Apply column and table tags to each table
+                    self.apply_column_tags(f"{catalog}.{schema}.{table_row['tableName']}")
+                    self.apply_table_tags(f"{catalog}.{schema}.{table_row['tableName']}")
