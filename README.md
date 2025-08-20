@@ -43,7 +43,7 @@ It uses spaCy’s NER 📚 to automatically detect entity types within your data
 **Download and Install the package in your notebook:**
 
 ```python
-pip install <PATH_TO_MODULE>
+pip install git+https://github.com/will-yuponce-db/databricks-automated-tagging.git@main
 ```
 
 ---
